@@ -215,6 +215,9 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
     const dev = newDevice;
     dev.idleRefineTimer = undefined;
     if (!dev.needsRefine || !dev.pageReady) return;
+    // The self-test page animates in bursts with idle gaps between them —
+    // refinement frames fired in those gaps would pollute its measurements.
+    if (dev.selfTestRunner.isActive()) return;
     // New content is flowing (or being processed) — its flushPending will
     // reschedule refinement when things settle again. Skipping here also
     // guarantees the refinement can never interleave with a newer frame and

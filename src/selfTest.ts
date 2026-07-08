@@ -9,12 +9,22 @@ export class SelfTestRunner {
   private _timeoutId0?: NodeJS.Timeout;
   private _timeoutId1?: NodeJS.Timeout;
   private _timeoutId2?: NodeJS.Timeout;
+  private _active = false;
 
   constructor(broadcaster: DeviceBroadcaster) {
     this._broadcaster = broadcaster;
   }
 
+  // The test page animates in bursts with sub-second idle gaps between them,
+  // so the idle-refinement pass would fire mid-stage and pollute the averages
+  // with heavy full-screen q90 frames. deviceManager checks this to suppress
+  // refinement while a measurement run is in progress.
+  public isActive(): boolean {
+    return this._active;
+  }
+
   public async startAsync(id: string, session: CDPSession): Promise<void> {
+    this._active = true;
     if (this._timeoutId0) clearTimeout(this._timeoutId0);
     if (this._timeoutId1) clearTimeout(this._timeoutId1);
     if (this._timeoutId2) clearTimeout(this._timeoutId2);
@@ -57,7 +67,9 @@ export class SelfTestRunner {
   public stop(): void {
     if (this._timeoutId0 || this._timeoutId1 || this._timeoutId2)
       console.log(`[Self test] Stopped`);
-    
+
+    this._active = false;
+
     if (this._timeoutId0) clearTimeout(this._timeoutId0);
     if (this._timeoutId1) clearTimeout(this._timeoutId1);
     if (this._timeoutId2) clearTimeout(this._timeoutId2);
