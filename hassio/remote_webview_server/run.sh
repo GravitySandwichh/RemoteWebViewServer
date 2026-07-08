@@ -14,10 +14,10 @@ get_opt() {
 
 export TILE_SIZE="$(get_opt tile_size 32)"
 export FULL_FRAME_TILE_COUNT="$(get_opt full_frame_tile_count 4)"
-export FULL_FRAME_AREA_THRESHOLD="$(get_opt full_frame_area_threshold 0.5)"
+export FULL_FRAME_AREA_THRESHOLD="$(get_opt full_frame_area_threshold 0.75)"
 export FULL_FRAME_EVERY="$(get_opt full_frame_every 50)"
 export EVERY_NTH_FRAME="$(get_opt every_nth_frame 1)"
-export MIN_FRAME_INTERVAL_MS="$(get_opt min_frame_interval_ms 80)"
+export MIN_FRAME_INTERVAL_MS="$(get_opt min_frame_interval_ms 33)"
 export JPEG_QUALITY="$(get_opt jpeg_quality 85)"
 export MAX_BYTES_PER_MESSAGE="$(get_opt max_bytes_per_message 14336)"
 export WS_PORT="$(get_opt ws_port 8081)"

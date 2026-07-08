@@ -23,10 +23,13 @@ export type InjectScriptConfig = {
 const DEFAULTS = {
   tileSize: 32,
   fullFrameTileCount: 4,
-  fullFrameAreaThreshold: 0.5,
+  // Full frames cost ~2x-2.5x the decode work of the actually-changed area on
+  // slow (software-decode) clients; only force one when nearly everything
+  // changed. Clients normally override this via the ffat query param anyway.
+  fullFrameAreaThreshold: 0.75,
   fullFrameEvery: 50,
   everyNthFrame: 1,
-  minFrameInterval: 80,
+  minFrameInterval: 33,
   jpegQuality: 85,
   maxBytesPerMessage: 14336,
   rotation: 0,
