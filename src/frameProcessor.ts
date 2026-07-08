@@ -32,6 +32,17 @@ export class FrameProcessor {
   private _iter = 0;
   private _fullFrameRequested = false;
 
+  // The periodic drift-correction refresh (every fullFrameEvery frames) used
+  // to force every tile changed in a single frame — re-encoding and
+  // re-decoding the whole screen at once. That's exactly the ~1-frame stutter
+  // every couple of seconds users saw: a big burst of JPEG encode (server)
+  // and JPEG decode (ESP32) cost landing in one frame interval. Instead,
+  // spread it across `fullframeTileCount` frames, one strip per frame,
+  // folded into the ordinary partial-diff path below — same eventual
+  // coverage, no single frame costs more than one extra strip.
+  private _sweepStrip = 0;
+  private _sweepRemaining = 0;
+
   constructor(cfg: FrameProcessorCfg) {
     this._cfg = cfg;
   }
@@ -39,17 +50,34 @@ export class FrameProcessor {
   public requestFullFrame(): void {
     this._iter = 0;
     this._fullFrameRequested = true;
+    this._sweepRemaining = 0; // an immediate full frame supersedes any in-flight sweep
   }
 
   public async processFrameAsync(rgba: RGBA): Promise<FrameOut> {
     if (!this._prev) this._initGrid(rgba.width, rgba.height);
 
-    let forceFull = (this._iter % this._cfg.fullFrameEvery) === 0;
+    let forceFull = false;
     if (this._fullFrameRequested) {
       forceFull = true;
       this._fullFrameRequested = false;
+    } else if ((this._iter % this._cfg.fullFrameEvery) === 0) {
+      // Due for drift correction — (re)start a progressive sweep rather than
+      // forcing a full frame right now.
+      this._sweepStrip = 0;
+      this._sweepRemaining = this._cfg.fullframeTileCount;
     }
+
     const chosenEncoding: Encoding = Encoding.JPEG;
+
+    // Which strip (if any) is being force-refreshed this frame as part of an
+    // in-progress sweep.
+    let sweepRect: { x: number; y: number; w: number; h: number } | undefined;
+    if (!forceFull && this._sweepRemaining > 0) {
+      const strips = this._splitWholeFrame(rgba.width, rgba.height, this._cfg.fullframeTileCount);
+      sweepRect = strips[this._sweepStrip];
+      this._sweepStrip++;
+      this._sweepRemaining--;
+    }
 
     type TileInfo = { x: number; y: number; w: number; h: number; idx: number; h32: number; changed: boolean };
     const tiles: TileInfo[] = [];
@@ -66,7 +94,10 @@ export class FrameProcessor {
         const h32 = hashTileInPlace(rgba.data, rgba.width, rgba.channels, x, y, w, h);
         const idx = ty * this._cols + tx;
         const prev = this._prev![idx];
-        const changed = forceFull || (prev !== h32);
+        let changed = forceFull || (prev !== h32);
+        if (!changed && sweepRect && y >= sweepRect.y && y < sweepRect.y + sweepRect.h) {
+          changed = true;
+        }
 
         tiles.push({ x, y, w, h, idx, h32, changed });
         if (changed) changedArea += w * h;
@@ -76,6 +107,7 @@ export class FrameProcessor {
     const totalArea = rgba.width * rgba.height;
     const changedPct = totalArea > 0 ? (changedArea / totalArea) : 0;
     const doFull = forceFull || (changedPct > this._cfg.fullframeAreaThreshold);
+    if (doFull) this._sweepRemaining = 0; // whole screen just got covered one way or another
 
     let out: FrameOut;
     if (doFull) {
