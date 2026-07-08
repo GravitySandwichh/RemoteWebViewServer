@@ -1,0 +1,55 @@
+services:
+  rwvserver:
+    build: ./RemoteWebViewServer
+    image: remote-webview-server:latest
+    container_name: remote-webview-server
+    restart: unless-stopped
+    environment:
+      TILE_SIZE: 32
+      FULL_FRAME_TILE_COUNT: 4
+      FULL_FRAME_AREA_THRESHOLD: 0.40
+      FULL_FRAME_EVERY: 60
+      EVERY_NTH_FRAME: 1
+      MIN_FRAME_INTERVAL_MS: 16
+      JPEG_QUALITY: 60
+      MAX_BYTES_PER_MESSAGE: 32768
+      WS_PORT: 8081
+      DEBUG_PORT: 9221 # internal debug port
+      HEALTH_PORT: 18080
+      PREFERS_REDUCED_MOTION: true
+      USER_DATA_DIR: /pw-data
+      BROWSER_LOCALE: "en-US"
+    ports:
+      - "8081:8081"
+      - "9222:9222"
+    expose:
+      - "18080" # healthcheck
+      - "9221" # debug port for socat
+    volumes:
+      - /opt/volumes/esp32-rdp/pw-data:/pw-data
+    devices:
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - "993"
+      - "44"
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18080 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  debug-proxy:
+    image: alpine/socat
+    container_name: remote-webview-server-debug
+    restart: unless-stopped
+    network_mode: "service:rwvserver"
+    depends_on:
+      rwvserver:
+        condition: service_healthy
+    command:
+    - "-d"
+    - "-d"
+    - "TCP-LISTEN:9222,fork,reuseaddr,keepalive" # external debug port
+    - "TCP:127.0.0.1:9221"
