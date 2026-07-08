@@ -132,7 +132,12 @@ export class FrameProcessor {
     // Encode all changed rects in parallel.
     const out = await Promise.all(
       mergedRects.map(async (r) => {
-        const raw = this._extractRaw(rgba, r.x, r.y, r.w, r.h);
+        // Full-width merged rects are contiguous in rgba.data, same as the
+        // full-frame strips — skip the row-by-row copy in that common case.
+        const ch = rgba.channels;
+        const raw = (r.x === 0 && r.w === rgba.width)
+          ? rgba.data.subarray(r.y * rgba.width * ch, (r.y + r.h) * rgba.width * ch)
+          : this._extractRaw(rgba, r.x, r.y, r.w, r.h);
         const data = await this._encode(raw, r.w, r.h, rgba.channels, encoding);
         return { ...r, data };
       })
