@@ -21,6 +21,7 @@ ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./package.json
 COPY self-test ./self-test
 EXPOSE 8080 8081 9221
 CMD ["node", "dist/index.js"]

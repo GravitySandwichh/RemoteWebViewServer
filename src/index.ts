@@ -1,4 +1,5 @@
 import http from 'http';
+import fs from 'fs';
 import { WebSocketServer } from "ws"
 import env from "env-var";
 import { makeConfigFromParams, setConfigFor, logDeviceConfig } from "./config.js";
@@ -9,6 +10,16 @@ import { MsgType } from './protocol.js';
 
 const WS_PORT = env.get("WS_PORT").default("8081").asIntPositive();
 const HEALTH_PORT = env.get("HEALTH_PORT").default("18080").asIntPositive();
+
+// Printed on every boot so a mismatch between "what's running" and "what I
+// just pushed" is immediately obvious in the add-on log, instead of quietly
+// debugging a deploy that never actually took effect.
+try {
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  console.log(`[server] remote-webview-server v${pkg.version}`);
+} catch {
+  console.log('[server] remote-webview-server (version unknown — package.json not found)');
+}
 
 // Bootstrap the browser/CDP connection before we start accepting device
 // connections. Previously the WS server started listening immediately and
