@@ -24,6 +24,18 @@ export type FrameProcessorCfg = {
   maxBytesPerMessage: number;
 };
 
+// Streaming vs idle-refinement encoding. Full-frame latency on the ESP32 is
+// dominated by Wi-Fi transfer of the 4 strips, not by decode (the JPEGDEC
+// fork ships ESP32-S3 SIMD for both 4:4:4 and 4:2:0) — so while content is
+// moving we encode 4:2:0 at the configured quality: ~35% fewer bytes on the
+// wire and the faster SIMD chroma path, with softness that motion masks.
+// Once the screen goes idle, deviceManager asks for a refinement pass and we
+// re-send everything at 4:4:4/REFINE_QUALITY — the static image the user
+// actually studies ends up crisper than the old always-4:4:4 stream.
+const STREAM_SUBSAMPLING = "4:2:0";
+const REFINE_SUBSAMPLING = "4:4:4";
+const REFINE_QUALITY = 90;
+
 export class FrameProcessor {
   private _cfg: FrameProcessorCfg;
   private _cols = 0;
@@ -32,7 +44,11 @@ export class FrameProcessor {
   // against the current frame to decide what changed. Just a reference to
   // last call's rgba.data — deviceManager hands us a freshly allocated
   // buffer every frame, so no copy is needed to keep this snapshot around.
+  // Also serves as the source for idle refinement re-encodes.
   private _prevFrame?: Buffer;
+  private _frameW = 0;
+  private _frameH = 0;
+  private _channels = 3;
   private _iter = 0;
   private _fullFrameRequested = false;
 
@@ -119,6 +135,9 @@ export class FrameProcessor {
       out = await this._processPartialFrame(rgba, tiles, chosenEncoding);
     }
     this._prevFrame = rgba.data;
+    this._frameW = rgba.width;
+    this._frameH = rgba.height;
+    this._channels = rgba.channels;
 
     const maxBytesPerTile = this._cfg.maxBytesPerMessage - FRAME_HEADER_BYTES - TILE_HEADER_BYTES;
     for (let i = 0; i < out.rects.length; i++) {
@@ -342,14 +361,46 @@ export class FrameProcessor {
     }
   }
 
-  private async _encodeJPEG(rawRgb: Buffer, w: number, h: number, channels: number): Promise<Buffer> {
+  private async _encodeJPEG(
+    rawRgb: Buffer, w: number, h: number, channels: number,
+    quality = this._cfg.jpegQuality,
+    chromaSubsampling: string = STREAM_SUBSAMPLING
+  ): Promise<Buffer> {
     return sharp(rawRgb, { raw: { width: w, height: h, channels: channels as 1 | 2 | 3 | 4 } })
-      // 4:4:4 encodes full color resolution per pixel. 4:2:0 (the default)
-      // discards 75% of chroma data, causing color bleeding at tile edges and
-      // smeared color transitions — visibly "shoddy" on colored UI elements.
-      // File size is ~15% larger but well within the 32 KB per-message limit.
-      .jpeg({ quality: this._cfg.jpegQuality, mozjpeg: false, chromaSubsampling: "4:4:4" })
+      .jpeg({ quality, mozjpeg: false, chromaSubsampling })
       .toBuffer();
+  }
+
+  /**
+   * Re-encode the entire last frame at maximum quality (4:4:4, REFINE_QUALITY)
+   * as full-frame strips. Called by deviceManager once the screen has been
+   * idle for a moment — latency is irrelevant then, so the strips can be as
+   * heavy as the per-message limit allows. Returns null if no frame has been
+   * processed yet. Strips that exceed the per-message budget fall back to the
+   * streaming quality, and are skipped entirely if still too large (the
+   * client simply keeps the already-displayed streamed version).
+   */
+  public async encodeRefinementAsync(): Promise<FrameOut | null> {
+    const data = this._prevFrame;
+    if (!data || !this._frameW) return null;
+
+    const w = this._frameW, h = this._frameH, ch = this._channels;
+    const maxBytesPerTile = this._cfg.maxBytesPerMessage - FRAME_HEADER_BYTES - TILE_HEADER_BYTES;
+    const strips = this._splitWholeFrame(w, h, this._cfg.fullframeTileCount);
+
+    const rects: Rect[] = [];
+    for (const r of strips) {
+      const raw = (r.x === 0 && r.w === w)
+        ? data.subarray(r.y * w * ch, (r.y + r.h) * w * ch)
+        : this._extractRaw({ data, width: w, height: h, channels: ch }, r.x, r.y, r.w, r.h);
+      let enc = await this._encodeJPEG(raw, r.w, r.h, ch, REFINE_QUALITY, REFINE_SUBSAMPLING);
+      if (enc.length > maxBytesPerTile)
+        enc = await this._encodeJPEG(raw, r.w, r.h, ch, this._cfg.jpegQuality, REFINE_SUBSAMPLING);
+      if (enc.length > maxBytesPerTile) continue;
+      rects.push({ x: r.x, y: r.y, w: r.w, h: r.h, data: enc });
+    }
+
+    return rects.length ? { rects, isFullFrame: true, encoding: Encoding.JPEG } : null;
   }
 
   private _encodeRAW565(rawRgb: Buffer, channels: number): Buffer {

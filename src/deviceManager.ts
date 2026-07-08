@@ -30,7 +30,17 @@ export type DeviceSession = {
   // set true by Page.loadEventFired, false by Page.frameNavigated (full loads only).
   pageReady: boolean;
   pageReadyTimer?: NodeJS.Timeout;
+  // idle refinement: once no new frames have arrived for IDLE_REFINE_MS,
+  // re-send the whole screen at 4:4:4 high quality (streaming is 4:2:0).
+  idleRefineTimer?: NodeJS.Timeout;
+  needsRefine: boolean;
 };
+
+// How long the screen must be still before the high-quality refinement pass
+// is sent. Long enough that a paused-then-resuming animation usually won't
+// collide with it, short enough that the user never consciously sees the
+// softer streamed image at rest.
+const IDLE_REFINE_MS = 800;
 
 const PREFERS_REDUCED_MOTION = /^(1|true|yes|on)$/i.test(process.env.PREFERS_REDUCED_MOTION ?? '');
 
@@ -126,6 +136,8 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
     // delivered after Page.loadEventFired signals the page is ready.
     pageReady: false,
     pageReadyTimer: undefined,
+    idleRefineTimer: undefined,
+    needsRefine: false,
   };
   devices.set(id, newDevice);
   newDevice.processor.requestFullFrame();
@@ -172,6 +184,9 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
       if (out.rects.length > 0) {
         dev.frameId = (dev.frameId + 1) >>> 0;
         broadcaster.sendFrameChunked(id, out, dev.frameId, cfg.maxBytesPerMessage);
+        // Streamed frames are 4:2:0 — remember to send the crisp 4:4:4 pass
+        // once the screen settles.
+        dev.needsRefine = true;
       }
     } catch (e) {
       console.warn(`[device] Failed to process frame for ${id}: ${(e as Error).message}`);
@@ -183,6 +198,44 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
       // It has already been waiting for the full duration of the current frame's
       // processing — adding another minFrameInterval delay here doubles the
       // effective frame time (was causing ~13fps instead of ~25fps at 33ms interval).
+      if (dev.pendingB64 && !dev.throttleTimer) {
+        dev.throttleTimer = setTimeout(flushPending, 0);
+      } else if (dev.needsRefine) {
+        scheduleIdleRefine();
+      }
+    }
+  };
+
+  const scheduleIdleRefine = () => {
+    if (newDevice.idleRefineTimer) clearTimeout(newDevice.idleRefineTimer);
+    newDevice.idleRefineTimer = setTimeout(runIdleRefine, IDLE_REFINE_MS);
+  };
+
+  const runIdleRefine = async () => {
+    const dev = newDevice;
+    dev.idleRefineTimer = undefined;
+    if (!dev.needsRefine || !dev.pageReady) return;
+    // New content is flowing (or being processed) — its flushPending will
+    // reschedule refinement when things settle again. Skipping here also
+    // guarantees the refinement can never interleave with a newer frame and
+    // overwrite it with older pixels: while processingFrame is set below,
+    // screencastFrame handlers only stash pendingB64, and the broadcaster
+    // queue is FIFO per device.
+    if (dev.processingFrame || dev.pendingB64) return;
+    if (broadcaster.getClientCount(dev.deviceId) === 0) return;
+
+    dev.processingFrame = true;
+    try {
+      const out = await dev.processor.encodeRefinementAsync();
+      if (out) {
+        dev.frameId = (dev.frameId + 1) >>> 0;
+        broadcaster.sendFrameChunked(dev.deviceId, out, dev.frameId, cfg.maxBytesPerMessage);
+      }
+      dev.needsRefine = false;
+    } catch (e) {
+      console.warn(`[device] Idle refinement failed for ${id}: ${(e as Error).message}`);
+    } finally {
+      dev.processingFrame = false;
       if (dev.pendingB64 && !dev.throttleTimer) {
         dev.throttleTimer = setTimeout(flushPending, 0);
       }
@@ -210,6 +263,11 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
       clearTimeout(newDevice.throttleTimer);
       newDevice.throttleTimer = undefined;
     }
+    if (newDevice.idleRefineTimer) {
+      clearTimeout(newDevice.idleRefineTimer);
+      newDevice.idleRefineTimer = undefined;
+    }
+    newDevice.needsRefine = false;
     // Fallback: if loadEventFired never arrives (page error, infinite spinner)
     // start streaming after 12 s so the user isn't stuck on a blank screen.
     if (newDevice.pageReadyTimer) clearTimeout(newDevice.pageReadyTimer);
@@ -303,6 +361,9 @@ async function deleteDeviceAsync(device: DeviceSession) {
 
   if (device.pageReadyTimer)
     clearTimeout(device.pageReadyTimer);
+
+  if (device.idleRefineTimer)
+    clearTimeout(device.idleRefineTimer);
 
   try { await device.cdp.send("Page.stopScreencast").catch(() => { }); } catch { }
   try { await root?.send("Target.closeTarget", { targetId: device.id }); } catch { }
