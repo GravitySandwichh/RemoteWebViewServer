@@ -10,31 +10,28 @@ export function hash32(buf: Buffer): number {
 }
 
 /**
- * Hash a tile region in-place from a packed RGBA/RGB frame buffer.
- * Identical FNV-1a kernel and sampling density as hash32(), but reads
- * directly from the strided source buffer — no Buffer allocation or copy.
+ * Exact equality check between the same tile region in two packed RGB/RGBA
+ * frame buffers of identical layout (same width/channels), reading directly
+ * from the strided source — no extraction copy needed. Used to be a sampled
+ * hash (every 4th byte) for speed, but that let a real pixel change go
+ * undetected whenever it happened to miss every sampled byte — the tile
+ * would then keep showing stale content until the next periodic full-frame
+ * correction caught up. Hashing was never the bottleneck (JPEG encode is,
+ * by a wide margin), so there's no real cost to just comparing every byte.
  * channels: 3 (RGB from JPEG screencast) or 4 (RGBA from PNG).
  */
-export function hashTileInPlace(
-  data: Buffer,
-  frameW: number,
-  channels: number,
-  x: number, y: number,
-  w: number, h: number
-): number {
-  let hv = 0x811C9DC5 >>> 0;
+export function tileRegionEqual(
+  a: Buffer, b: Buffer,
+  frameW: number, channels: number,
+  x: number, y: number, w: number, h: number
+): boolean {
+  const rowBytes = w * channels;
   const rowStride = frameW * channels;
   for (let r = 0; r < h; r++) {
-    const rowBase = (y + r) * rowStride + x * channels;
-    const rowEnd  = rowBase + w * channels;
-    for (let o = rowBase; o < rowEnd; o += 16) {
-      hv ^= data[o];           hv = (hv * 0x01000193) >>> 0;
-      hv ^= data[o + 4]  ?? 0; hv = (hv * 0x01000193) >>> 0;
-      hv ^= data[o + 8]  ?? 0; hv = (hv * 0x01000193) >>> 0;
-      hv ^= data[o + 12] ?? 0; hv = (hv * 0x01000193) >>> 0;
-    }
+    const base = (y + r) * rowStride + x * channels;
+    if (a.compare(b, base, base + rowBytes, base, base + rowBytes) !== 0) return false;
   }
-  return hv >>> 0;
+  return true;
 }
 
 export type Rotation = 0 | 90 | 180 | 270;

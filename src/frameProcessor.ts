@@ -1,7 +1,7 @@
 import os from "node:os";
 import sharp from "sharp";
 import { Encoding, FRAME_HEADER_BYTES, TILE_HEADER_BYTES } from "./protocol.js";
-import { hash32, hashTileInPlace } from "./util.js";
+import { tileRegionEqual } from "./util.js";
 
 sharp.concurrency(Math.max(1, os.cpus().length - 1));
 
@@ -28,7 +28,11 @@ export class FrameProcessor {
   private _cfg: FrameProcessorCfg;
   private _cols = 0;
   private _rows = 0;
-  private _prev?: Uint32Array;
+  // Previous frame's raw pixels, compared exactly (byte-for-byte per tile)
+  // against the current frame to decide what changed. Just a reference to
+  // last call's rgba.data — deviceManager hands us a freshly allocated
+  // buffer every frame, so no copy is needed to keep this snapshot around.
+  private _prevFrame?: Buffer;
   private _iter = 0;
   private _fullFrameRequested = false;
 
@@ -54,7 +58,7 @@ export class FrameProcessor {
   }
 
   public async processFrameAsync(rgba: RGBA): Promise<FrameOut> {
-    if (!this._prev) this._initGrid(rgba.width, rgba.height);
+    if (this._cols === 0) this._initGrid(rgba.width, rgba.height);
 
     let forceFull = false;
     if (this._fullFrameRequested) {
@@ -79,7 +83,7 @@ export class FrameProcessor {
       this._sweepRemaining--;
     }
 
-    type TileInfo = { x: number; y: number; w: number; h: number; idx: number; h32: number; changed: boolean };
+    type TileInfo = { x: number; y: number; w: number; h: number; changed: boolean };
     const tiles: TileInfo[] = [];
     let changedArea = 0;
 
@@ -90,16 +94,15 @@ export class FrameProcessor {
         const w = Math.min(this._cfg.tileSize, rgba.width - x);
         const h = Math.min(this._cfg.tileSize, rgba.height - y);
 
-        // Hash the tile directly from the strided RGB/RGBA buffer — no copy needed.
-        const h32 = hashTileInPlace(rgba.data, rgba.width, rgba.channels, x, y, w, h);
-        const idx = ty * this._cols + tx;
-        const prev = this._prev![idx];
-        let changed = forceFull || (prev !== h32);
+        // Compare directly against the previous frame's strided buffer — no
+        // extraction copy, no sampling, so no chance of a missed change.
+        let changed = forceFull || !this._prevFrame ||
+          !tileRegionEqual(rgba.data, this._prevFrame, rgba.width, rgba.channels, x, y, w, h);
         if (!changed && sweepRect && y >= sweepRect.y && y < sweepRect.y + sweepRect.h) {
           changed = true;
         }
 
-        tiles.push({ x, y, w, h, idx, h32, changed });
+        tiles.push({ x, y, w, h, changed });
         if (changed) changedArea += w * h;
       }
     }
@@ -111,10 +114,11 @@ export class FrameProcessor {
 
     let out: FrameOut;
     if (doFull) {
-      out = await this._processFullFrame(rgba, tiles, chosenEncoding);
+      out = await this._processFullFrame(rgba, chosenEncoding);
     } else {
       out = await this._processPartialFrame(rgba, tiles, chosenEncoding);
     }
+    this._prevFrame = rgba.data;
 
     const maxBytesPerTile = this._cfg.maxBytesPerMessage - FRAME_HEADER_BYTES - TILE_HEADER_BYTES;
     for (let i = 0; i < out.rects.length; i++) {
@@ -131,7 +135,6 @@ export class FrameProcessor {
 
   private async _processFullFrame(
     rgba: RGBA,
-    tilesInfo: { idx: number; h32: number }[],
     encoding: Encoding
   ): Promise<FrameOut> {
     const rectsForFull = this._splitWholeFrame(rgba.width, rgba.height, this._cfg.fullframeTileCount);
@@ -149,14 +152,12 @@ export class FrameProcessor {
       })
     );
 
-    for (const t of tilesInfo) this._prev![t.idx] = t.h32;
-
     return { rects, isFullFrame: true, encoding };
   }
 
   private async _processPartialFrame(
     rgba: RGBA,
-    tiles: { x: number; y: number; w: number; h: number; idx: number; h32: number; changed: boolean }[],
+    tiles: { x: number; y: number; w: number; h: number; changed: boolean }[],
     encoding: Encoding
   ): Promise<FrameOut> {
     const mergedRects = this._mergeChangedTiles(tiles, rgba.width, rgba.height);
@@ -174,8 +175,6 @@ export class FrameProcessor {
         return { ...r, data };
       })
     );
-
-    for (const t of tiles) if (t.changed) this._prev![t.idx] = t.h32;
 
     return { rects: out, isFullFrame: false, encoding };
   }
@@ -258,7 +257,7 @@ export class FrameProcessor {
   }
 
   private _mergeChangedTiles(
-    tiles: { x: number; y: number; w: number; h: number; idx: number; h32: number; changed: boolean }[],
+    tiles: { x: number; y: number; w: number; h: number; changed: boolean }[],
     frameW: number,
     frameH: number
   ): { x: number; y: number; w: number; h: number }[] {
@@ -320,7 +319,6 @@ export class FrameProcessor {
   private _initGrid(w: number, h: number) {
     this._cols = Math.ceil(w / this._cfg.tileSize);
     this._rows = Math.ceil(h / this._cfg.tileSize);
-    this._prev = new Uint32Array(this._cols * this._rows);
   }
 
   private _extractRaw(rgba: RGBA, x: number, y: number, w: number, h: number): Buffer {
