@@ -281,35 +281,21 @@ export class FrameProcessor {
     frameH: number
   ): { x: number; y: number; w: number; h: number }[] {
     const cols = this._cols, rows = this._rows;
-    const raw: boolean[][] = Array.from({ length: rows }, () => Array<boolean>(cols).fill(false));
+    const changed: boolean[][] = Array.from({ length: rows }, () => Array<boolean>(cols).fill(false));
     const visited: boolean[][] = Array.from({ length: rows }, () => Array<boolean>(cols).fill(false));
 
     for (let i = 0; i < tiles.length; i++) {
       const ty = Math.floor(i / cols);
       const tx = i % cols;
-      raw[ty][tx] = tiles[i].changed;
+      changed[ty][tx] = tiles[i].changed;
     }
 
-    // Dilate the changed mask by one tile (8-neighborhood) before merging,
-    // bridging up-to-one-tile gaps between changed regions so nearby small
-    // changes coalesce into one rect. On-device measurement (ESP32-S3):
-    // every JPEG tile costs ~2-3ms of fixed decode setup (header parse +
-    // Huffman table build) regardless of size, while extra pixels cost only
-    // ~65ns each plus ~1.2us/byte — so ten scattered 32px rects (~25-30ms)
-    // vastly outcost one bigger rect containing them and some unchanged
-    // pixels (~4-6ms). The extra pixels are re-encoded from the current
-    // frame, so correctness is unaffected.
-    const changed: boolean[][] = Array.from({ length: rows }, () => Array<boolean>(cols).fill(false));
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        if (!raw[r][c]) continue;
-        for (let rr = Math.max(0, r - 1); rr <= Math.min(rows - 1, r + 1); rr++) {
-          for (let cc = Math.max(0, c - 1); cc <= Math.min(cols - 1, c + 1); cc++) {
-            changed[rr][cc] = true;
-          }
-        }
-      }
-    }
+    // NOTE (v1.4.3): v1.4.2 dilated this mask by one tile to merge nearby
+    // rects and save per-tile JPEG setup on the client. Measured on-device it
+    // was a net LOSS — thin horizontal changes (sliders) grew whole extra
+    // tile-rows, tripling decoded pixels per frame (partial avg 5-6ms ->
+    // 24ms), and the per-tile setup cost it targeted turned out to be partly
+    // scheduler noise in the original measurement. Exact changed tiles only.
 
     const { widths, heights, xOffsets, yOffsets } = this._calcGridSplits(frameW, frameH);
     const { maxW, maxH } = this._getMaxFullTileSize(frameW, frameH);
