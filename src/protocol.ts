@@ -37,7 +37,10 @@ export enum Encoding {
   JPEG        = 2,
   RAW565      = 3,
   RAW565_RLE  = 4,
-  RAW565_LZ4  = 5
+  RAW565_LZ4  = 5,
+  // Tile header describes the screen rect; payload is a half-resolution
+  // JPEG the client decodes and pixel-doubles. Requires client >= 1.6.0.
+  JPEG_HALF   = 6,
 }
 
 export enum TouchKind {
