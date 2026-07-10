@@ -35,6 +35,15 @@ export type FrameProcessorCfg = {
 const STREAM_SUBSAMPLING = "4:2:0";
 const REFINE_SUBSAMPLING = "4:4:4";
 const REFINE_QUALITY = 90;
+// Full-frame strips (scene cuts: >threshold area changed, or an explicit
+// refresh) are capped at this quality. On-device cost model (ESP32-S3,
+// SIMD decode): Huffman costs ~1.2us per compressed byte and is the largest
+// share of a full-screen repaint (~18ms of ~44ms at q75's ~16KB). Capping
+// scene cuts at 55 cuts that roughly in half, bringing full repaints near
+// the 33ms/30fps budget. The quality cost is confined to the single
+// transition frame: partial updates keep the configured quality, and the
+// idle refinement re-sends everything at 4:4:4 q90 within ~1s.
+const FULLFRAME_QUALITY = 55;
 
 export class FrameProcessor {
   private _cfg: FrameProcessorCfg;
@@ -158,6 +167,7 @@ export class FrameProcessor {
   ): Promise<FrameOut> {
     const rectsForFull = this._splitWholeFrame(rgba.width, rgba.height, this._cfg.fullframeTileCount);
 
+    const quality = Math.min(this._cfg.jpegQuality, FULLFRAME_QUALITY);
     const rects = await Promise.all(
       rectsForFull.map(async (r) => {
         // Full-frame tiles are horizontal strips with x=0, w=frameWidth.
@@ -166,7 +176,9 @@ export class FrameProcessor {
         const raw = (r.x === 0 && r.w === rgba.width)
           ? rgba.data.subarray(r.y * rgba.width * ch, (r.y + r.h) * rgba.width * ch)
           : this._extractRaw(rgba, r.x, r.y, r.w, r.h);
-        const data = await this._encode(raw, r.w, r.h, ch, encoding);
+        const data = (encoding === Encoding.JPEG)
+          ? await this._encodeJPEG(raw, r.w, r.h, ch, quality, STREAM_SUBSAMPLING)
+          : await this._encode(raw, r.w, r.h, ch, encoding);
         return { x: r.x, y: r.y, w: r.w, h: r.h, data };
       })
     );
