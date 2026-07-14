@@ -36,20 +36,13 @@ const STREAM_SUBSAMPLING = "4:2:0";
 const REFINE_SUBSAMPLING = "4:4:4";
 const REFINE_QUALITY = 90;
 // Full-frame strips (scene cuts: >threshold area changed, or an explicit
-// refresh) are sent HALF-RESOLUTION (Encoding.JPEG_HALF): a clean q75->q55
-// A/B on-device proved full-res repaints are pixel-bound, not byte-bound —
-// scalar IDCT plus framebuffer writes put a hard ~40-42ms floor under a
-// full 480x480 decode, over the 33ms/30fps budget. Quarter the pixels
-// lands scene cuts at ~20-25ms. The transition frame is visibly soft for
-// the ~1s until idle refinement re-sends everything at 4:4:4 q90 — an
-// explicit user choice of latency over one frame's sharpness. Partial
-// updates and refinement stay full resolution.
-// Requires client >= 1.6.0 (older clients skip enc=6 tiles: deploy the
-// client first). HALFRES_QUALITY is generous since resolution, not
-// quantization, is the dominant loss here.
-const HALFRES_QUALITY = 70;
-// Fallback quality for full-res full-frame strips (odd-sized rects that
-// can't be cleanly halved).
+// refresh) are capped at this quality. NOTE (v1.5.1): half-resolution scene
+// cuts (Encoding.JPEG_HALF, ~20-30ms vs ~42ms) were tried in v1.5.0 and
+// removed — visibly glitchy on the device. The client (>= 1.6.0) still
+// decodes JPEG_HALF fine if this is ever revisited; the artifact source
+// (client pixel-doubling vs server resize) was never diagnosed. Scene cuts
+// are single frames replaced by the q90 refinement within ~1s, so the q55
+// cap costs nothing visible while trimming bytes.
 const FULLFRAME_QUALITY = 55;
 
 export class FrameProcessor {
@@ -159,11 +152,7 @@ export class FrameProcessor {
     for (let i = 0; i < out.rects.length; i++) {
       const r = out.rects[i];
       if (r.data.length > maxBytesPerTile) {
-        // Match the frame's encoding: a JPEG_HALF frame needs a half-size
-        // red payload since the client pixel-doubles it into the rect.
-        const redData = (out.encoding === Encoding.JPEG_HALF)
-          ? await this._makeRedFrameAsync(Math.max(1, r.w >> 1), Math.max(1, r.h >> 1), chosenEncoding)
-          : await this._makeRedFrameAsync(r.w, r.h, chosenEncoding);
+        const redData = await this._makeRedFrameAsync(r.w, r.h, chosenEncoding);
         out.rects[i] = { x: r.x, y: r.y, w: r.w, h: r.h, data: redData };
       }
     }
@@ -178,14 +167,7 @@ export class FrameProcessor {
   ): Promise<FrameOut> {
     const rectsForFull = this._splitWholeFrame(rgba.width, rgba.height, this._cfg.fullframeTileCount);
 
-    // Half-res only works if every strip halves cleanly (they always do for
-    // even display dimensions); an all-or-nothing choice keeps the frame's
-    // encoding field uniform across its messages.
-    const canHalve = encoding === Encoding.JPEG &&
-      rectsForFull.every((r) => r.w % 2 === 0 && r.h % 2 === 0 && r.w >= 2 && r.h >= 2);
-    const outEncoding = canHalve ? Encoding.JPEG_HALF : encoding;
-    const fallbackQuality = Math.min(this._cfg.jpegQuality, FULLFRAME_QUALITY);
-
+    const quality = Math.min(this._cfg.jpegQuality, FULLFRAME_QUALITY);
     const rects = await Promise.all(
       rectsForFull.map(async (r) => {
         // Full-frame tiles are horizontal strips with x=0, w=frameWidth.
@@ -194,22 +176,14 @@ export class FrameProcessor {
         const raw = (r.x === 0 && r.w === rgba.width)
           ? rgba.data.subarray(r.y * rgba.width * ch, (r.y + r.h) * rgba.width * ch)
           : this._extractRaw(rgba, r.x, r.y, r.w, r.h);
-        let data: Buffer;
-        if (canHalve) {
-          data = await sharp(raw, { raw: { width: r.w, height: r.h, channels: ch as 1 | 2 | 3 | 4 } })
-            .resize(r.w / 2, r.h / 2)
-            .jpeg({ quality: HALFRES_QUALITY, mozjpeg: false, chromaSubsampling: STREAM_SUBSAMPLING })
-            .toBuffer();
-        } else if (encoding === Encoding.JPEG) {
-          data = await this._encodeJPEG(raw, r.w, r.h, ch, fallbackQuality, STREAM_SUBSAMPLING);
-        } else {
-          data = await this._encode(raw, r.w, r.h, ch, encoding);
-        }
+        const data = (encoding === Encoding.JPEG)
+          ? await this._encodeJPEG(raw, r.w, r.h, ch, quality, STREAM_SUBSAMPLING)
+          : await this._encode(raw, r.w, r.h, ch, encoding);
         return { x: r.x, y: r.y, w: r.w, h: r.h, data };
       })
     );
 
-    return { rects, isFullFrame: true, encoding: outEncoding };
+    return { rects, isFullFrame: true, encoding };
   }
 
   private async _processPartialFrame(
